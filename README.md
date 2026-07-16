@@ -1,0 +1,1 @@
+This GitHub repository provides the MATLAB codes and example datasets used to reproduce the three case studies (Leendert de Boerspolder, Taipei, and Baytown) presented in Ching et al. (2026), "Gaussian-process trend framework for efficient simulation of 3D multivariate conditional random fields," submitted to Computers and Geotechnics.
