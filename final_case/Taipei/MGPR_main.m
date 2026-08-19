@@ -1,907 +1,610 @@
-%% MUSIC-X Taipei: t-const MGPR vs MGPR
-%  功能：
-%  1) 同時跑 t-const 與 MGPR
-%  2) 記錄 TMCMC time、CRF generation time
-%  3) 輸出兩模型 log evidence
-%  4) 輸出 MAE、RMSE_point、RMSE_BV = sqrt(mean(bias^2 + predictive variance))、95% CI coverage、CI width
-%  5) 畫 paper-style 比較圖：灰色=t-const，紫色=MGPR，綠色=one MGPR CRF realization，黃色=observed data
+%% Taipei site: streamlined MGPR analysis
+% -------------------------------------------------------------------------
+% Purpose
+%   1. Read and transform the Taipei MUSIC-X data.
+%   2. Estimate MGPR hyperparameters with TMCMC.
+%   3. Generate posterior conditional realizations.
+%   4. Report prediction metrics and draw one five-panel result figure.
 %
-%  注意：本主程式沿用你原本的函式：
-%  iTMCMC_fun_mod1, BaytownGP_Matern_3D, GP_matrices_Step3,
-%  Matern_R, DW_sampler_new2, vertical_dense_stats, kronmult2,
-%  JS_2_normal_gb, JS_2_original_gb
+% Saving is OFF by default. Set SAVE_RESULTS or SAVE_FIGURE to true only
+% when files are needed.
+%
 
 clear; clc; close all;
-
-tic_total = tic;
+total_timer = tic;
 rng(10,'twister');
-rand('state',10); %#ok<RAND>
-randn('state',10); %#ok<RAND>
 
-%% ============================================================
-%  0. 使用者設定
-%% ============================================================
-T_mcmc = 1000;       % 正式建議 1000；快速測試可改 10 或 50
+%% ======================== USER SETTINGS ================================
+T_mcmc     = 10;       % Use 1000 for the formal analysis
 tmcmc_beta = 0.5;
 
-SAVE_OUTPUT = true;
-PLOT_ONE_CRF = true;
+SAVE_RESULTS = false;  % MAT and metric tables
+SAVE_FIGURE  = false;  % PNG and FIG
+PLOT_ONE_REALIZATION = true;
 
-% 原始10維順序: 1=LL,2=PI,3=LI,4=sv,5=sp,6=su,7=St,8=Bq,9=qt1,10=qtu
-use_param = [1 1 1 1 1 1 0 0 1 0];
-%              LL PI LI sv sp su St Bq qt1 qtu
+OUTPUT_DIR = fullfile(pwd,'Taipei_MGPR_results');
+PNG_RESOLUTION = 300;
 
-Pa = 101.3;   % kN/m^2 = kPa
+% Original 10-D order:
+% 1=LL, 2=PI, 3=LI, 4=sigma'_v/Pa, 5=sigma'_p/Pa,
+% 6=su/sigma'_v, 7=St, 8=Bq, 9=qt1, 10=qtu.
+USE_PARAM = [1 1 1 1 1 1 0 0 1 0];
 
-%% ============================================================
-%  1. 基礎設定與載入
-%% ============================================================
-load CLAY_10_7490_para_rho.mat;   % needs: type, ax, bx, ay, by, rho
+PA_KPA = 101.3;
+EIG_THRESHOLD = 0.999;
+PLOT_DEPTH_LIMIT = [12 27];
 
-keep_idx = find(use_param);
-M = length(keep_idx);
-fprintf('\n============================================================\n');
-fprintf('使用 %d 個參數，index: %s\n', M, num2str(keep_idx));
-fprintf('============================================================\n');
+%% ======================== LOAD MODEL INPUTS ============================
+J = load('CLAY_10_7490_para_rho.mat');
+C = load('Cs_site_Md.mat');
 
-log_ind_all  = [1 1 0 1 1 1 1 0 1 1];
-param_name_all = {'LL (%)','PI (%)','LI (%)','\sigma''_v/P_a','\sigma''_p/P_a', ...
-                  's_u/\sigma''_v','S_t','B_q','q_{t1}','q_{tu}'};
+required_fields = {'type','ax','bx','ay','by'};
+for k = 1:numel(required_fields)
+    assert(isfield(J,required_fields{k}), ...
+        'CLAY_10_7490_para_rho.mat lacks %s.',required_fields{k});
+end
 
-log_ind    = log_ind_all(keep_idx);
-param_name = param_name_all(keep_idx); %#ok<NASGU>
+keep_idx = find(USE_PARAM);
+M = numel(keep_idx);
 
-type_6 = type(keep_idx);
-ax_6   = ax(keep_idx);
-bx_6   = bx(keep_idx);
-ay_6   = ay(keep_idx);
-by_6   = by(keep_idx);
+log_ind_all = [1 1 0 1 1 1 1 0 1 1];
+param_name_all = {'LL (%)','PI (%)','LI', ...
+    '\sigma''_v/P_a','\sigma''_p/P_a','s_u/\sigma''_v', ...
+    'S_t','B_q','q_{t1}','q_{tu}'};
 
-%% ===== 讀取/整理 Cs =====
-S_Cs = load('Cs_site_Md.mat');
-if isfield(S_Cs,'Cs')
-    Cs = S_Cs.Cs;
+log_ind = log_ind_all(keep_idx);
+param_name = param_name_all(keep_idx);
+
+johnson_type = J.type(keep_idx);
+johnson_ax = J.ax(keep_idx);
+johnson_bx = J.bx(keep_idx);
+johnson_ay = J.ay(keep_idx);
+johnson_by = J.by(keep_idx);
+
+if isfield(C,'Cs')
+    Cs = double(C.Cs);
 else
-    fn = fieldnames(S_Cs);
-    Cs = S_Cs.(fn{1});
+    names = fieldnames(C);
+    Cs = double(C.(names{1}));
 end
 
-% 如果 Cs 是10維，截取成 keep_idx；如果已經是M維，直接用
+% Accept either the original 10-D matrix or an already reduced M-D matrix.
 if size(Cs,1) == numel(log_ind_all)
-    Cs = Cs(keep_idx, keep_idx);
-elseif size(Cs,1) ~= M
-    error('Cs dimension mismatch: size(Cs,1)=%d, M=%d. 請確認 Cs_site_Md.mat。', size(Cs,1), M);
+    Cs = Cs(keep_idx,keep_idx);
+elseif ~isequal(size(Cs),[M M])
+    error('Cs dimension mismatch: expected 10x10 or %dx%d.',M,M);
 end
 
-% 標準化成 correlation matrix，並確保正定
-D  = diag(1 ./ sqrt(diag(Cs)));
-Cs = D * Cs * D;
-Cs = (Cs + Cs')/2;
-min_eig_Cs = min(eig(Cs));
-if min_eig_Cs <= 0
-    Cs = Cs + (-min_eig_Cs + 1e-8) * eye(size(Cs));
-    fprintf('警告：Cs 非正定，已加入 jitter 修正。\n');
-end
+% Convert Cs to a correlation matrix and enforce positive definiteness.
+scale_diag = diag(Cs);
+assert(all(isfinite(scale_diag) & scale_diag > 0), ...
+    'Cs must have finite positive diagonal entries.');
+Dcorr = diag(1./sqrt(scale_diag));
+Cs = Dcorr*Cs*Dcorr;
+Cs = make_spd(Cs,1e-8);
 
-[phi_t_Cs, omega_t_Cs] = eig(Cs);
-eigvals = diag(omega_t_Cs);
-[~, idx_sort] = sort(eigvals, 'descend');
-phi_t_Cs = phi_t_Cs(:, idx_sort);
-L_Cs_fixed = chol(Cs, 'lower');
+[phi_t_Cs,D_Cs] = eig(Cs);
+[~,order] = sort(diag(D_Cs),'descend');
+phi_t_Cs = phi_t_Cs(:,order);
+L_Cs = chol(Cs,'lower');
 
-%% 找各參數的新 index
-idx_LL = find(keep_idx==1, 1);
-idx_PI = find(keep_idx==2, 1);
-idx_LI = find(keep_idx==3, 1);
-idx_sv = find(keep_idx==4, 1);   % sigma'_v / Pa
-idx_sp = find(keep_idx==5, 1);   % sigma'_p / Pa
-idx_su = find(keep_idx==6, 1);   % su / sigma'_v
+% The five-panel result requires these six model inputs.
+required_original_idx = [1 2 3 4 5 6];
+assert(all(ismember(required_original_idx,keep_idx)), ...
+    'USE_PARAM must include LL, PI, LI, sv, sp, and su.');
 
-if any(cellfun(@isempty,{idx_LL,idx_PI,idx_LI,idx_sv,idx_sp,idx_su}))
-    error('keep_idx 必須包含 LL, PI, LI, sv, sp, su，否則無法畫五欄比較圖。');
-end
+fprintf('\n%s\n',repmat('=',1,76));
+fprintf('Taipei MGPR analysis\n');
+fprintf('Selected parameters: %s\n',strjoin(param_name,', '));
+fprintf('TMCMC population: %d\n',T_mcmc);
+fprintf('%s\n',repmat('=',1,76));
 
-%% ============================================================
-%  2. 讀取台北廠址 Excel 資料
-%% ============================================================
-ttt = xlsread('Taipei_case_table.xlsx');
+%% ======================== READ AND TRANSFORM DATA ======================
+data_table = xlsread('Taipei_case_table.xlsx');
 
-% 沿用你原本的資料篩選：刪掉偶數列
-ttt([2:2:276],:) = [];
+% Preserve the row selection used in the supplied program.
+data_table(2:2:276,:) = [];
 
-z  = ttt(:,1);
-z  = z(:);
-nz = length(z);
+z = data_table(:,1);
+z = z(:);
+nz = numel(z);
 
-y_site_full       = ttt(:,11:19);
-y_site_full(:,10) = nan;        % 補第10個 qtu 欄位，讓 keep_idx 可對應10維順序
+site_full = data_table(:,11:19);
+site_full(:,10) = NaN;  % Add qtu so columns follow the original 10-D order
 
-y_site   = y_site_full(:, keep_idx);
-y_actual = y_site;              % 原始物理空間資料
-qt_actual = ttt(:,2); %#ok<NASGU>
+y_actual = site_full(:,keep_idx);
+y_transformed = y_actual;
 
-% log 轉換
-for i = 1:M
-    if log_ind(i) == 1
-        y_site(:,i) = log(y_site(:,i));
+% Apply the same log transformations as the original program.
+for p = 1:M
+    if log_ind(p)
+        y_transformed(y_transformed(:,p) <= 0,p) = NaN;
+        y_transformed(:,p) = log(y_transformed(:,p));
     end
 end
 
-% Johnson 轉 normal space
-x_site = nan(nz, M);
-for i = 1:M
-    valid = ~isnan(y_site(:,i));
-    x_site(valid,i) = JS_2_normal_gb(y_site(valid,i), ...
-        type_6(i), ax_6(i), bx_6(i), ay_6(i), by_6(i));
-end
-
-%% ============================================================
-%  3. 組 y struct 與距離矩陣
-%% ============================================================
-param_mean = nan(1, M);
-t_mat = zeros(nz, M);
+% Map each available observation to Johnson normal space.
+x_site = nan(nz,M);
 for p = 1:M
-    param_mean(p) = nanmean(x_site(:,p));
-    t_mat(:,p)    = x_site(:,p) - param_mean(p);
+    valid = isfinite(y_transformed(:,p));
+    x_site(valid,p) = JS_2_normal_gb(y_transformed(valid,p), ...
+        johnson_type(p),johnson_ax(p),johnson_bx(p), ...
+        johnson_ay(p),johnson_by(p));
 end
+x_site = real(x_site);
 
+% Center every parameter using its available site observations.
+param_mean = mean(x_site,1,'omitnan');
+t_mat = x_site-param_mean;
+
+%% ======================== MGPR DATA STRUCTURE ==========================
+% Taipei is represented by one vertical profile at X=Y=0.
 y = struct();
 y.t = t_mat(:);
 y.z = z;
 y.X = 0;
 y.Y = 0;
+y.temp_h = 0;
+y.temp_z = abs(z-z');
+y.eig_thresh = EIG_THRESHOLD;
+
 X_test = 0;
 Y_test = 0;
 
-temp_h = 0;
-temp_z = abs(z*ones(1,nz) - (z*ones(1,nz))');
-y.temp_z = temp_z;
-y.temp_h = temp_h;
-y.eig_thresh = 0.999;
+% Prediction uses the same vertical profile and coordinates.
+y.temp_h_ele = [0 0;0 0];
+y.temp_z_ele = abs([z;z]-[z;z]');
 
-% prediction grid = same vertical profile
-all_X = [y.X; X_test];
-all_Y = [y.Y; Y_test];
-all_z = [z; z];
-temp_x_ele = abs(all_X - all_X');
-temp_y_ele = abs(all_Y - all_Y');
-y.temp_h_ele = sqrt(temp_x_ele.^2 + temp_y_ele.^2);
-y.temp_z_ele = abs(all_z*ones(1,length(all_z)) - (all_z*ones(1,length(all_z)))');
-
-%% ============================================================
-%  4. 兩個模型的 hyperparameter bounds
-%% ============================================================
-% 7個參數順序：
-% x1 -> b = 1/exp(x1)
-% x2 -> residual SOF_v
-% x3 -> residual SOF_h
-% x4 -> residual nu_v, nu_h=nu_v
-% x5 -> a = 1/exp(x5)
-% x6 -> trend SOF_v
-% x7 -> trend SOF_h
-
-z_range = max(temp_z(:));
-if z_range <= 0
-    z_range = max(z) - min(z);
-end
-if z_range <= 0
-    z_range = 1;
+%% ======================== HYPERPARAMETER BOUNDS ========================
+% x = [b^{-1}, SOFv_e, SOFh_e, nu_e, a^{-1}, SOFv_t, SOFh_t]
+z_range = max(y.temp_z(:));
+if ~isfinite(z_range) || z_range <= 0
+    z_range = max(max(z)-min(z),1);
 end
 
-% ===== MGPR：trend SOF 由資料估 =====
-x_low_mgpr = [-log(10),   log(0.2), log(1),     log(0.3), -log(10),   log(z_range/10), log(1)];
-x_up_mgpr  = [-log(0.01), log(10),  log(1.001), log(3),   -log(0.01), log(z_range*10), log(1.001)];
+x_low = [-log(10), log(0.2), log(1), log(0.3), ...
+         -log(10), log(z_range/10), log(1)];
+x_up  = [-log(0.01), log(10), log(1.001), log(3), ...
+         -log(0.01), log(z_range*10), log(1.001)];
 
-% ===== t-const：把 trend SOF_v 固定在超大值，使 trend kernel 近似常數 =====
-% 這等價於 t(z) 幾乎不隨深度變化，只剩 constant trend。
-CONST_TREND_SOF_Z = max(1e5, z_range*1e4);
-x_low_tconst = [-log(10),   log(0.2), log(1),     log(0.3), -log(10),   log(CONST_TREND_SOF_Z*0.999), log(1)];
-x_up_tconst  = [-log(0.01), log(10),  log(1.001), log(3),   -log(0.01), log(CONST_TREND_SOF_Z*1.001), log(1.001)];
+%% ======================== RUN MGPR =====================================
+MGPR = run_mgpr(y,x_low,x_up,T_mcmc,tmcmc_beta,Cs, ...
+    param_mean,johnson_type,johnson_ax,johnson_bx,johnson_ay,johnson_by, ...
+    log_ind,z,M,phi_t_Cs,L_Cs,X_test,Y_test);
 
-%% ============================================================
-%  5. 只跑 MGPR
-%% ============================================================
-fprintf('\n============================================================\n');
-fprintf('開始模型：MGPR only\n');
-fprintf('============================================================\n');
+Plot = build_plot_result(MGPR.samples_original,y_actual,z,keep_idx,PA_KPA);
+Metrics = calculate_metrics(Plot);
 
-Results = struct();
+TimingEvidence = table(MGPR.time_tmcmc_sec,MGPR.time_crf_sec, ...
+    MGPR.log_evidence,'VariableNames', ...
+    {'TMCMC_sec','ConditionalSimulation_sec','LogEvidence'});
 
-Results.MGPR = run_one_model( ...
-    'MGPR', y, x_low_mgpr, x_up_mgpr, ...
-    T_mcmc, tmcmc_beta, Cs, ...
-    param_mean, type_6, ax_6, bx_6, ay_6, by_6, log_ind, ...
-    z, M, phi_t_Cs, L_Cs_fixed, X_test, Y_test);
-
-Results.MGPR.Plot = build_plot_result( ...
-    Results.MGPR, y_actual, z, keep_idx, Pa);
-
-%% ============================================================
-%  6. 指標：MAE / RMSE / RMSE_BV / CI coverage / CI width
-%% ============================================================
-Metrics_MGPR = calc_metrics_table('MGPR', Results.MGPR.Plot);
-
-TimingEvidence = table( ...
-    {'MGPR'}, ...
-    Results.MGPR.time_tmcmc_sec, ...
-    Results.MGPR.time_crf_sec, ...
-    Results.MGPR.logEvidence, ...
-    'VariableNames', {'Model','TMCMC_sec','CRF_sec','LogEvidence'});
-
-fprintf('\n================ Timing and model evidence ================\n');
+fprintf('\nTiming and model evidence\n');
 disp(TimingEvidence);
+fprintf('Prediction metrics\n');
+disp(Metrics);
 
-fprintf('\n================ MGPR metrics ================\n');
-disp(Metrics_MGPR);
+%% ======================== RESULT FIGURE ================================
+fig_result = plot_mgpr_profiles(Plot,PLOT_ONE_REALIZATION,PLOT_DEPTH_LIMIT);
 
-%% ============================================================
-%  7. Paper-style MGPR only figure
-%% ============================================================
-fig_cmp = plot_mgpr_only(Results.MGPR.Plot, PLOT_ONE_CRF);
+%% ======================== OPTIONAL SAVING ==============================
+% No directory or file is created while both saving switches are false.
+if SAVE_RESULTS || SAVE_FIGURE
+    if ~exist(OUTPUT_DIR,'dir')
+        mkdir(OUTPUT_DIR);
+    end
+end
 
-%% ============================================================
-%  8. 儲存輸出
-%% ============================================================
-if SAVE_OUTPUT
-    out_prefix = sprintf('Taipei_MGPR_only_T%d', T_mcmc);
+base_name = sprintf('Taipei_MGPR_T%d',T_mcmc);
 
-    save([out_prefix '.mat'], 'Results', 'Metrics_MGPR', 'TimingEvidence', ...
-        'keep_idx', 'use_param', 'Cs', 'z', 'y_actual', 'T_mcmc', '-v7.3');
+if SAVE_RESULTS
+    save(fullfile(OUTPUT_DIR,[base_name '.mat']), ...
+        'MGPR','Plot','Metrics','TimingEvidence','keep_idx','USE_PARAM', ...
+        'Cs','z','y_actual','T_mcmc','-v7.3');
 
     try
-        writetable(TimingEvidence, [out_prefix '_metrics.xlsx'], 'Sheet', 'TimingEvidence');
-        writetable(Metrics_MGPR,   [out_prefix '_metrics.xlsx'], 'Sheet', 'Metrics');
+        metric_file = fullfile(OUTPUT_DIR,[base_name '_metrics.xlsx']);
+        writetable(TimingEvidence,metric_file,'Sheet','TimingEvidence');
+        writetable(Metrics,metric_file,'Sheet','Metrics');
     catch ME
-        warning('writetable to xlsx failed: %s', ME.message);
-        writetable(TimingEvidence, [out_prefix '_TimingEvidence.csv']);
-        writetable(Metrics_MGPR,   [out_prefix '_Metrics.csv']);
+        warning('XLSX export failed: %s',ME.message);
+        writetable(TimingEvidence,fullfile(OUTPUT_DIR, ...
+            [base_name '_TimingEvidence.csv']));
+        writetable(Metrics,fullfile(OUTPUT_DIR,[base_name '_Metrics.csv']));
     end
+end
+
+if SAVE_FIGURE
+    png_file = fullfile(OUTPUT_DIR,[base_name '.png']);
+    try
+        exportgraphics(fig_result,png_file,'Resolution',PNG_RESOLUTION);
+    catch
+        print(fig_result,png_file,'-dpng',sprintf('-r%d',PNG_RESOLUTION));
+    end
+    savefig(fig_result,fullfile(OUTPUT_DIR,[base_name '.fig']));
+end
+
+elapsed_total = toc(total_timer);
+fprintf('Total elapsed time: %.2f sec (%.2f min)\n', ...
+    elapsed_total,elapsed_total/60);
+
+%% ======================== LOCAL FUNCTIONS ==============================
+function R = run_mgpr(y,x_low,x_up,T_mcmc,tmcmc_beta,Cs, ...
+    param_mean,type_p,ax_p,bx_p,ay_p,by_p,log_ind, ...
+    z,M,phi_t_Cs,L_Cs,X_test,Y_test)
+
+nz = numel(z);
+
+fprintf('\nStarting TMCMC...\n');
+timer_tmcmc = tic;
+[x_mcmc,ln_S,~,~,~] = iTMCMC_fun_mod1( ...
+    'GP_Matern_3D',y,x_low,x_up,T_mcmc,tmcmc_beta,Cs);
+time_tmcmc_sec = toc(timer_tmcmc);
+fprintf('TMCMC completed in %.2f sec (%.2f min).\n', ...
+    time_tmcmc_sec,time_tmcmc_sec/60);
+
+if isempty(ln_S)
+    log_evidence = NaN;
+else
+    log_evidence = sum(ln_S(:));
+end
+
+b = 1./exp(x_mcmc(:,1));
+sofv = exp(x_mcmc(:,2));
+sofh = exp(x_mcmc(:,3));
+nuv = exp(x_mcmc(:,4));
+nuh = nuv;
+a = 1./exp(x_mcmc(:,5));
+sofv_t = exp(x_mcmc(:,6));
+sofh_t = exp(x_mcmc(:,7));
+
+fprintf('Starting posterior conditional simulation...\n');
+timer_crf = tic;
+
+jitter_h = 1e-6;
+jitter_z = 1e-6;
+jitter_precision = 1e-11;
+nh_train = numel(y.X);
+Npost = size(x_mcmc,1);
+samples_normal_centered = nan(nz*M,Npost);
+
+for i = 1:Npost
+    [phiz,phih,phiz_ele,phih_ele,~,ln_alpha] = ...
+        GP_matrices_Step3(a(i),sofv_t(i),sofh_t(i),y,Cs);
+
+    y_local = y;
+    y_local.phiz = phiz;
+    y_local.phih = phih;
+    y_local.phiz_ele = phiz_ele;
+    y_local.phih_ele = phih_ele;
+
+    A_diag = exp(ln_alpha(:));
+
+    Rh = Matern_R(nuh(i),sofh(i),y.temp_h)+jitter_h*eye(nh_train);
+    Rz = Matern_R(nuv(i),sofv(i),y.temp_z)+jitter_z*eye(nz);
+    Lh = chol(Rh,'lower');
+    Lz = chol(Rz,'lower');
+
+    data_grid = reshape(y.t,nz,nh_train*M);
+    data_grid = DW_sampler_new2(data_grid,y.X,y.Y,z, ...
+        sofv(i),sofh(i),nuv(i),nuh(i),b(i),A_diag,y_local,Cs, ...
+        sofv_t(i),sofh_t(i),M);
+    data_vec = data_grid(:);
+
+    A_h = (Lh'\(Lh\phih)).';
+    A_z = (Lz'\(Lz\phiz)).';
+    A_c = (L_Cs'\(L_Cs\phi_t_Cs)).';
+    rhs = kronmult2({A_c,A_h,A_z},data_vec);
+
+    precision = spdiags(A_diag,0,numel(A_diag),numel(A_diag))+ ...
+        (1/b(i))*kron(A_c*phi_t_Cs,kron(A_h*phih,A_z*phiz));
+    precision = (precision+precision')/2+ ...
+        jitter_precision*speye(size(precision,1));
 
     try
-        exportgraphics(fig_cmp, [out_prefix '.png'], 'Resolution', 300);
+        Lp = chol(precision,'lower');
     catch
-        print(fig_cmp, [out_prefix '.png'], '-dpng', '-r300');
+        precision = full((precision+precision')/2)+ ...
+            jitter_precision*eye(size(precision,1));
+        Lp = chol(precision,'lower');
     end
-    savefig(fig_cmp, [out_prefix '.fig']);
 
-    fprintf('\n已輸出：\n');
-    fprintf('  %s.mat\n', out_prefix);
-    fprintf('  %s_metrics.xlsx 或 csv\n', out_prefix);
-    fprintf('  %s.png / %s.fig\n', out_prefix, out_prefix);
+    mu_w = (1/b(i))*(Lp'\(Lp\rhs));
+    w = mu_w+(Lp'\(Lp\randn(size(mu_w))));
+
+    trend_test = kronmult2({phi_t_Cs,phih_ele,phiz_ele}, ...
+        reshape(w,[],M));
+    residual_train = data_vec- ...
+        kronmult2({phi_t_Cs,phih,phiz},w);
+
+    [mean_residual,Lh_test,Lz_test] = vertical_dense_stats( ...
+        sofv(i),sofh(i),nuv(i),nuh(i),X_test,Y_test,z, ...
+        y.X,y.Y,z,residual_train,M);
+
+    residual_test = mean_residual+sqrt(b(i))* ...
+        kronmult2({L_Cs,Lh_test,Lz_test},randn(nz*M,1));
+
+    samples_normal_centered(:,i) = trend_test(:)+residual_test(:);
 end
 
-fprintf('\n總時間 = %.2f sec = %.2f min\n', toc(tic_total), toc(tic_total)/60);
+samples_original = inverse_to_original(samples_normal_centered,nz,M, ...
+    param_mean,type_p,ax_p,bx_p,ay_p,by_p,log_ind);
 
-%% ========================================================================
-%  Local functions
-%% ========================================================================
+time_crf_sec = toc(timer_crf);
+fprintf('Conditional simulation completed in %.2f sec (%.2f min).\n', ...
+    time_crf_sec,time_crf_sec/60);
+fprintf('Log evidence: %.6g\n',log_evidence);
 
-function R = run_one_model(model_label, y, x_low, x_up, T_mcmc, tmcmc_beta, Cs, ...
-    param_mean, type_6, ax_6, bx_6, ay_6, by_6, log_ind, ...
-    z, M, phi_t_Cs, L_Cs_fixed, X_test, Y_test)
+R = struct();
+R.x_mcmc = x_mcmc;
+R.ln_S = ln_S;
+R.log_evidence = log_evidence;
+R.time_tmcmc_sec = time_tmcmc_sec;
+R.time_crf_sec = time_crf_sec;
+R.samples_original = samples_original;
+end
 
-    nz = length(z);
+function X_original = inverse_to_original(X_centered,nz,M,param_mean, ...
+    type_p,ax_p,bx_p,ay_p,by_p,log_ind)
 
-    %% ===== TMCMC =====
-    fprintf('[%s] 開始 TMCMC...\n', model_label);
-    tic_tmcmc = tic;
-    [x_mcmc, ln_S, ~, ~, ~] = iTMCMC_fun_mod1('GP_Matern_3D', y, x_low, x_up, T_mcmc, tmcmc_beta, Cs);
-    time_tmcmc_sec = toc(tic_tmcmc);
-    fprintf('[%s] TMCMC 完成，time = %.2f sec = %.2f min\n', model_label, time_tmcmc_sec, time_tmcmc_sec/60);
+Npost = size(X_centered,2);
+X_original = nan(size(X_centered));
 
-    % model evidence：若 ln_S 是每個stage的increment，sum(ln_S) 即 log evidence；若本來是scalar也不影響
-    if isempty(ln_S)
-        logEvidence = NaN;
-    else
-        logEvidence = sum(ln_S(:));
-    end
-
-    bhp_mcmc    = 1./exp(x_mcmc(:,1));
-    sofv_mcmc   = exp(x_mcmc(:,2));
-    sofh_mcmc   = exp(x_mcmc(:,3));
-    nuv_mcmc    = exp(x_mcmc(:,4));
-    nuh_mcmc    = nuv_mcmc;
-    ahp_mcmc    = 1./exp(x_mcmc(:,5));
-    sofv_t_mcmc = exp(x_mcmc(:,6));
-    sofh_t_mcmc = exp(x_mcmc(:,7));
-
-    %% ===== CRF conditional simulation =====
-    fprintf('[%s] 開始生成 CRF...\n', model_label);
-    tic_crf = tic;
-
-    jitterRh = 1e-6;
-    jitterRz = 1e-6;
-    jitterP  = 1e-11;
-
-    nh_train = numel(y.X);
-    Npost = size(x_mcmc, 1);
-
-    t_ele     = zeros(nz * M, Npost);
-    trend_ele = zeros(nz * M, Npost);
-
-    for i = 1:Npost
-        [y_phiz, y_phih, y_phiz_ele, y_phih_ele, ~, ln_alpha] = ...
-            GP_matrices_Step3(ahp_mcmc(i), sofv_t_mcmc(i), sofh_t_mcmc(i), y, Cs);
-
-        y.phiz     = y_phiz;
-        y.phih     = y_phih;
-        y.phiz_ele = y_phiz_ele;
-        y.phih_ele = y_phih_ele;
-
-        A_diag = exp(ln_alpha(:));
-
-        R_h = Matern_R(nuh_mcmc(i), sofh_mcmc(i), y.temp_h);
-        R_z = Matern_R(nuv_mcmc(i), sofv_mcmc(i), y.temp_z);
-
-        Rh = R_h + jitterRh * eye(nh_train);
-        Rz = R_z + jitterRz * eye(nz);
-
-        Lh_R = chol(Rh, 'lower');
-        Lz_R = chol(Rz, 'lower');
-
-        reshape_data = reshape(y.t, nz, nh_train*M);
-        reshape_data = DW_sampler_new2(reshape_data, y.X, y.Y, z, ...
-            sofv_mcmc(i), sofh_mcmc(i), nuv_mcmc(i), nuh_mcmc(i), ...
-            bhp_mcmc(i), A_diag, y, Cs, sofv_t_mcmc(i), sofh_t_mcmc(i), M);
-
-        reshape_vec = reshape(reshape_data, [], 1);
-
-        AA = (Lh_R' \ (Lh_R \ y_phih)).';
-        BB = (Lz_R' \ (Lz_R \ y_phiz)).';
-        CC = (L_Cs_fixed' \ (L_Cs_fixed \ phi_t_Cs)).';
-
-        temp_vec = kronmult2({CC, AA, BB}, reshape_vec);
-        bhp = bhp_mcmc(i);
-
-        P = spdiags(A_diag, 0, length(A_diag), length(A_diag)) + ...
-            (1/bhp) * kron(CC*phi_t_Cs, kron(AA*y_phih, BB*y_phiz));
-        P = (P + P')/2 + jitterP * speye(size(P,1));
-
-        try
-            Rchol = chol(P, 'lower');
-        catch
-            Pf = full(P);
-            Pf = (Pf + Pf')/2 + jitterP * eye(size(Pf,1));
-            Rchol = chol(Pf, 'lower');
-        end
-
-        mu = (1/bhp) * (Rchol' \ (Rchol \ temp_vec));
-        w  = mu + (Rchol' \ (Rchol \ randn(size(mu))));
-        w_row = w.';
-
-        d_ele  = kronmult2({phi_t_Cs, y_phih_ele, y_phiz_ele}, reshape(w_row.', [], M));
-        t_diff = reshape_vec - kronmult2({phi_t_Cs, y_phih, y_phiz}, w);
-
-        [E_X, L_h, L_z] = vertical_dense_stats(sofv_mcmc(i), sofh_mcmc(i), ...
-            nuv_mcmc(i), nuh_mcmc(i), X_test, Y_test, z, y.X, y.Y, z, t_diff, M);
-
-        noise = E_X + sqrt(bhp) * kronmult2({L_Cs_fixed, L_h, L_z}, randn(nz*M, 1));
-
-        t_ele(:,i)     = d_ele(:) + noise(:);
-        trend_ele(:,i) = d_ele(:);
-    end
-
-    %% ===== inverse transform to physical space =====
-    t_ele_original = inverse_to_original(t_ele, nz, M, param_mean, type_6, ax_6, bx_6, ay_6, by_6, log_ind);
-    trend_original = inverse_to_original(trend_ele, nz, M, param_mean, type_6, ax_6, bx_6, ay_6, by_6, log_ind);
-
-    pred_mean   = nan(nz, M);
-    pred_median = nan(nz, M);
-    pred_p025   = nan(nz, M);
-    pred_p975   = nan(nz, M);
-    pred_single = nan(nz, M);
-
-    trend_median = nan(nz, M);
-    trend_p025   = nan(nz, M);
-    trend_p975   = nan(nz, M);
-
+for i = 1:Npost
+    Xi = reshape(X_centered(:,i),nz,M);
     for p = 1:M
-        row_idx = (1:nz) + (p-1)*nz;
-
-        p_samp = t_ele_original(row_idx, :);
-        pred_mean(:,p)   = nanmean_row(p_samp);
-        pred_median(:,p) = prctile(p_samp, 50,   2);
-        pred_p025(:,p)   = prctile(p_samp, 2.5,  2);
-        pred_p975(:,p)   = prctile(p_samp, 97.5, 2);
-        pred_single(:,p) = p_samp(:,1);
-
-        tr_samp = trend_original(row_idx, :);
-        trend_median(:,p) = prctile(tr_samp, 50,   2);
-        trend_p025(:,p)   = prctile(tr_samp, 2.5,  2);
-        trend_p975(:,p)   = prctile(tr_samp, 97.5, 2);
-    end
-
-    time_crf_sec = toc(tic_crf);
-    fprintf('[%s] CRF 完成，time = %.2f sec = %.2f min\n', model_label, time_crf_sec, time_crf_sec/60);
-    fprintf('[%s] log evidence = %.6g\n', model_label, logEvidence);
-
-    %% ===== store =====
-    R = struct();
-    R.model_label = model_label;
-    R.x_mcmc = x_mcmc;
-    R.ln_S = ln_S;
-    R.logEvidence = logEvidence;
-    R.time_tmcmc_sec = time_tmcmc_sec;
-    R.time_crf_sec   = time_crf_sec;
-
-    R.bhp_mcmc = bhp_mcmc;
-    R.sofv_mcmc = sofv_mcmc;
-    R.sofh_mcmc = sofh_mcmc;
-    R.nuv_mcmc = nuv_mcmc;
-    R.nuh_mcmc = nuh_mcmc;
-    R.ahp_mcmc = ahp_mcmc;
-    R.sofv_t_mcmc = sofv_t_mcmc;
-    R.sofh_t_mcmc = sofh_t_mcmc;
-
-    R.t_ele = t_ele;
-    R.trend_ele = trend_ele;
-    R.t_ele_original = t_ele_original;
-    R.trend_original = trend_original;
-
-    R.pred_mean = pred_mean;
-    R.pred_median = pred_median;
-    R.pred_p025 = pred_p025;
-    R.pred_p975 = pred_p975;
-    R.pred_single = pred_single;
-
-    R.trend_median = trend_median;
-    R.trend_p025 = trend_p025;
-    R.trend_p975 = trend_p975;
-end
-
-function X_original = inverse_to_original(X_normal_centered, nz, M, param_mean, type_6, ax_6, bx_6, ay_6, by_6, log_ind)
-    Npost = size(X_normal_centered, 2);
-    X_original = zeros(size(X_normal_centered));
-
-    for i = 1:Npost
-        X_reshaped = reshape(X_normal_centered(:,i), nz, M);
-        for p = 1:M
-            data_normal = X_reshaped(:,p) + param_mean(p);
-            tmp = JS_2_original_gb(data_normal, type_6(p), ax_6(p), bx_6(p), ay_6(p), by_6(p));
-            if log_ind(p) == 1
-                X_reshaped(:,p) = exp(tmp);
-            else
-                X_reshaped(:,p) = tmp;
-            end
+        z_absolute = Xi(:,p)+param_mean(p);
+        value = JS_2_original_gb(z_absolute,type_p(p),ax_p(p), ...
+            bx_p(p),ay_p(p),by_p(p));
+        if log_ind(p)
+            value = exp(value);
         end
-        X_original(:,i) = X_reshaped(:);
+        Xi(:,p) = real(value);
     end
+    X_original(:,i) = Xi(:);
+end
 end
 
-function Plot = build_plot_result(R, y_actual, z, keep_idx, Pa)
-    nz = length(z);
+function Plot = build_plot_result(samples_original,y_actual,z,keep_idx,Pa)
+nz = numel(z);
 
-    idx_LL = find(keep_idx == 1, 1);
-    idx_PI = find(keep_idx == 2, 1);
-    idx_LI = find(keep_idx == 3, 1);
-    idx_sv = find(keep_idx == 4, 1);
-    idx_sp = find(keep_idx == 5, 1);
-    idx_su = find(keep_idx == 6, 1);
+idx_LL = find(keep_idx == 1,1);
+idx_PI = find(keep_idx == 2,1);
+idx_LI = find(keep_idx == 3,1);
+idx_sv = find(keep_idx == 4,1);
+idx_sp = find(keep_idx == 5,1);
+idx_su = find(keep_idx == 6,1);
 
-    Plot = struct();
-    Plot.depth_m = z(:);
+Plot = struct();
+Plot.depth_m = z(:);
 
-    % ----- direct samples -----
-    s_LL = get_param_samples(R.t_ele_original, nz, idx_LL);
-    s_PI = get_param_samples(R.t_ele_original, nz, idx_PI);
-    s_LI = get_param_samples(R.t_ele_original, nz, idx_LI);
-    s_sv = get_param_samples(R.t_ele_original, nz, idx_sv);
-    s_sp = get_param_samples(R.t_ele_original, nz, idx_sp);
-    s_su_ratio = get_param_samples(R.t_ele_original, nz, idx_su);
+Plot.samples.LL = get_parameter_samples(samples_original,nz,idx_LL);
+Plot.samples.PI = get_parameter_samples(samples_original,nz,idx_PI);
+Plot.samples.LI = get_parameter_samples(samples_original,nz,idx_LI);
 
-    % ----- derived samples -----
-    s_sigma_p = s_sp * Pa;
-    s_su = s_sv * Pa .* s_su_ratio;
+sp_ratio = get_parameter_samples(samples_original,nz,idx_sp);
+sv_ratio = get_parameter_samples(samples_original,nz,idx_sv);
+su_ratio = get_parameter_samples(samples_original,nz,idx_su);
+Plot.samples.sigma_p_eff = sp_ratio*Pa;
+Plot.samples.su = sv_ratio*Pa.*su_ratio;
 
-    Plot.samples.LL = s_LL;
-    Plot.samples.PI = s_PI;
-    Plot.samples.LI = s_LI;
-    Plot.samples.sigma_p_eff = s_sigma_p;
-    Plot.samples.su = s_su;
+Plot.observed.LL = y_actual(:,idx_LL);
+Plot.observed.PI = y_actual(:,idx_PI);
+Plot.observed.LI = y_actual(:,idx_LI);
+Plot.observed.sigma_p_eff = y_actual(:,idx_sp)*Pa;
+Plot.observed.su = y_actual(:,idx_sv)*Pa.*y_actual(:,idx_su);
 
-    Plot.real.LL = y_actual(:,idx_LL);
-    Plot.real.PI = y_actual(:,idx_PI);
-    Plot.real.LI = y_actual(:,idx_LI);
-    Plot.real.sigma_p_eff = y_actual(:,idx_sp) * Pa;
-    Plot.real.su = y_actual(:,idx_sv) * Pa .* y_actual(:,idx_su);
+fields = {'LL','PI','LI','sigma_p_eff','su'};
+for k = 1:numel(fields)
+    field = fields{k};
+    S = Plot.samples.(field);
+    Plot.mean.(field) = row_mean(S);
+    Plot.median.(field) = prctile(S,50,2);
+    Plot.CI_low.(field) = prctile(S,2.5,2);
+    Plot.CI_up.(field) = prctile(S,97.5,2);
+    Plot.one.(field) = S(:,1);
+    Plot.variance.(field) = row_variance(S);
+end
+end
 
-    flds = {'LL','PI','LI','sigma_p_eff','su'};
-    for k = 1:numel(flds)
-        f = flds{k};
-        S = Plot.samples.(f);
-        Plot.mean.(f)   = nanmean_row(S);
-        Plot.median.(f) = prctile(S, 50,   2);
-        Plot.CI_low.(f) = prctile(S, 2.5,  2);
-        Plot.CI_up.(f)  = prctile(S, 97.5, 2);
-        Plot.one.(f)    = S(:,1);
-        Plot.var.(f)    = nanvar_row(S);
+function S = get_parameter_samples(X,nz,param_idx)
+rows = (1:nz)+(param_idx-1)*nz;
+S = X(rows,:);
+end
+
+function T = calculate_metrics(Plot)
+fields = {'LL','PI','LI','sigma_p_eff','su'};
+names = {'LL (%)','PI (%)','LI', ...
+    'sigma''_p (kPa)','s_u (kPa)'};
+n = numel(fields);
+
+Parameter = names(:);
+N = nan(n,1);
+Bias = nan(n,1);
+MAE = nan(n,1);
+RMSE_point = nan(n,1);
+RMSE_BV = nan(n,1);
+Coverage95_percent = nan(n,1);
+Mean_CI_width = nan(n,1);
+
+for k = 1:n
+    f = fields{k};
+    observed = Plot.observed.(f)(:);
+    median_value = Plot.median.(f)(:);
+    mean_value = Plot.mean.(f)(:);
+    lower = Plot.CI_low.(f)(:);
+    upper = Plot.CI_up.(f)(:);
+    predictive_variance = Plot.variance.(f)(:);
+
+    valid = isfinite(observed) & isfinite(median_value) & ...
+        isfinite(mean_value) & isfinite(lower) & isfinite(upper) & ...
+        isfinite(predictive_variance);
+    N(k) = nnz(valid);
+
+    if N(k) == 0
+        continue;
     end
+
+    error_median = median_value(valid)-observed(valid);
+    error_mean = mean_value(valid)-observed(valid);
+    pred_var = predictive_variance(valid);
+
+    Bias(k) = mean(error_median);
+    MAE(k) = mean(abs(error_median));
+    RMSE_point(k) = sqrt(mean(error_median.^2));
+    RMSE_BV(k) = sqrt(mean(error_mean.^2+pred_var));
+    Coverage95_percent(k) = 100*mean( ...
+        observed(valid) >= lower(valid) & observed(valid) <= upper(valid));
+    Mean_CI_width(k) = mean(upper(valid)-lower(valid));
 end
 
-function S = get_param_samples(X_original, nz, idx_param)
-    row_idx = (1:nz) + (idx_param-1)*nz;
-    S = X_original(row_idx, :);
+T = table(Parameter,N,Bias,MAE,RMSE_point,RMSE_BV, ...
+    Coverage95_percent,Mean_CI_width);
 end
 
-function T = calc_metrics_table(model_name, Plot)
-    fields = {'LL','PI','LI','sigma_p_eff','su'};
-    names  = {'LL (%)','PI (%)','LI (%)','sigma''_p (kN/m^2)','s_u (kN/m^2)'};
+function fig = plot_mgpr_profiles(Plot,plot_one,depth_limit)
+fields = {'LL','PI','LI','sigma_p_eff','su'};
+x_labels = {'LL (%)','PI (%)','LI', ...
+    '\sigma''_p (kPa)','s_u (kPa)'};
+x_limits = {[20 50],[0 30],[0 2.5],[1e1 1e3],[20 120]};
+use_log_x = [false false false true false];
+panel_labels = {'(a)','(b)','(c)','(d)','(e)'};
 
-    n = numel(fields);
-    Model = cell(n,1);
-    Parameter = cell(n,1);
-    N = nan(n,1);
-    Bias = nan(n,1);
-    MAE = nan(n,1);
-    RMSE_point = nan(n,1);
-    RMSE_BV = nan(n,1);
-    Coverage95_percent = nan(n,1);
-    Mean_CI_width = nan(n,1);
+color_median = [1.00 0.00 1.00];
+color_realization = [0.00 0.65 0.00];
+color_data = [1.00 0.90 0.00];
 
-    for k = 1:n
-        f = fields{k};
-        obs = Plot.real.(f)(:);
-        med = Plot.median.(f)(:);
-        mu  = Plot.mean.(f)(:);
-        lo  = Plot.CI_low.(f)(:);
-        hi  = Plot.CI_up.(f)(:);
-        pv  = Plot.var.(f)(:);
+fig = figure('Name','Taipei MGPR','Color','w', ...
+    'Position',[80 80 1180 500]);
 
-        valid = isfinite(obs) & isfinite(med) & isfinite(mu) & isfinite(lo) & isfinite(hi) & isfinite(pv);
+left_margin = 0.055;
+right_blank = 0.205;
+bottom = 0.16;
+height = 0.76;
+gap = 0.040;
+n_panels = numel(fields);
+panel_width = (1-left_margin-right_blank-gap*(n_panels-1))/n_panels;
+depth = Plot.depth_m(:);
 
-        err_med = med(valid) - obs(valid);
-        err_mu  = mu(valid)  - obs(valid);
-        pv_v    = pv(valid);
+for k = 1:n_panels
+    field = fields{k};
+    left = left_margin+(k-1)*(panel_width+gap);
+    axh = axes('Position',[left bottom panel_width height]); %#ok<LAXES>
+    hold(axh,'on'); box(axh,'on');
 
-        Model{k} = model_name;
-        Parameter{k} = names{k};
-        N(k) = sum(valid);
-
-        if N(k) > 0
-            Bias(k) = mean(err_med);
-            MAE(k) = mean(abs(err_med));
-            RMSE_point(k) = sqrt(mean(err_med.^2));
-
-            % 你要的 bias^2 + variance 版本：
-            % RMSE_BV = sqrt( mean( (predictive mean - observed)^2 + predictive variance ) )
-            RMSE_BV(k) = sqrt(mean(err_mu.^2 + pv_v));
-
-            Coverage95_percent(k) = 100 * mean(obs(valid) >= lo(valid) & obs(valid) <= hi(valid));
-            Mean_CI_width(k) = mean(hi(valid) - lo(valid));
+    if use_log_x(k)
+        plot_positive_profile(axh,Plot.median.(field),depth,'-', ...
+            color_median,1.6);
+        plot_positive_profile(axh,Plot.CI_low.(field),depth,'--', ...
+            color_median,1.2);
+        plot_positive_profile(axh,Plot.CI_up.(field),depth,'--', ...
+            color_median,1.2);
+        if plot_one
+            plot_positive_profile(axh,Plot.one.(field),depth,'-', ...
+                color_realization,1.0);
         end
-    end
-
-    T = table(Model, Parameter, N, Bias, MAE, RMSE_point, RMSE_BV, Coverage95_percent, Mean_CI_width);
-end
-
-function fig = plot_mgpr_only(MG, PLOT_ONE_CRF)
-    field_name = {'LL','PI','LI','sigma_p_eff','su'};
-
-    x_label = { ...
-        'LL (%)', ...
-        'PI (%)', ...
-        'LI (%)', ...
-        '\sigma''_p (kN/m^2)', ...
-        's_u (kN/m^2)'};
-
-    x_lim = { ...
-        [20 50], ...
-        [0 30], ...
-        [0 2.5], ...
-        [1e1 1e3], ...
-        [20 120]};
-
-    use_log_x = [false false false true false];
-    panel_label = {'(a)','(b)','(c)','(d)','(e)'};
-
-    col_mgpr = [1.00 0.00 1.00];
-    col_crf  = [0.00 0.65 0.00];
-    col_data = [1.00 0.90 0.00];
-
-    lw_med = 1.6;
-    lw_CI  = 1.2;
-    lw_crf = 1.0;
-
-    fig = figure('Name','MGPR only', 'Color','w', 'Position',[80 80 1180 500]);
-
-    left_margin = 0.055;
-    right_blank = 0.205;
-    bottom_pos  = 0.16;
-    height_pos  = 0.76;
-    gap         = 0.040;
-    n_col       = 5;
-
-    tile_width = (1 - left_margin - right_blank - gap*(n_col-1)) / n_col;
-    depth = MG.depth_m(:);
-
-    for k = 1:n_col
-        fname = field_name{k};
-        left_pos = left_margin + (k-1)*(tile_width + gap);
-
-        ax = axes('Position',[left_pos bottom_pos tile_width height_pos]); %#ok<LAXES>
-        hold(ax,'on'); box(ax,'on');
-
-        if use_log_x(k)
-            plot_profile_log(ax, MG.median.(fname), depth, '-',  col_mgpr, lw_med);
-            plot_profile_log(ax, MG.CI_low.(fname), depth, '--', col_mgpr, lw_CI);
-            plot_profile_log(ax, MG.CI_up.(fname),  depth, '--', col_mgpr, lw_CI);
-
-            if PLOT_ONE_CRF
-                plot_profile_log(ax, MG.one.(fname), depth, '-', col_crf, lw_crf);
-            end
-
-            x_real = MG.real.(fname);
-            valid_real = isfinite(x_real) & isfinite(depth) & x_real > 0;
-            semilogx(ax, x_real(valid_real), depth(valid_real), 'o', ...
-                'MarkerSize', 5.5, ...
-                'MarkerFaceColor', col_data, ...
-                'MarkerEdgeColor','k', ...
-                'LineWidth',0.8, ...
-                'LineStyle','none');
-
-            set(ax,'XScale','log');
-        else
-            plot(ax, MG.median.(fname), depth, '-',  'Color', col_mgpr, 'LineWidth', lw_med);
-            plot(ax, MG.CI_low.(fname), depth, '--', 'Color', col_mgpr, 'LineWidth', lw_CI);
-            plot(ax, MG.CI_up.(fname),  depth, '--', 'Color', col_mgpr, 'LineWidth', lw_CI);
-
-            if PLOT_ONE_CRF
-                plot(ax, MG.one.(fname), depth, '-', 'Color', col_crf, 'LineWidth', lw_crf);
-            end
-
-            x_real = MG.real.(fname);
-            valid_real = isfinite(x_real) & isfinite(depth);
-            plot(ax, x_real(valid_real), depth(valid_real), 'o', ...
-                'MarkerSize', 5.5, ...
-                'MarkerFaceColor', col_data, ...
-                'MarkerEdgeColor','k', ...
-                'LineWidth',0.8, ...
-                'LineStyle','none');
-        end
-
-        set(ax,'YDir','reverse');
-        ylim(ax, [12 27]);
-        xlim(ax, x_lim{k});
-
-        xlabel(ax, x_label{k}, 'FontSize', 13);
-        ylabel(ax, 'Depth (m)', 'FontSize', 12);
-
-        set(ax, ...
-            'FontSize', 10, ...
-            'LineWidth', 0.9, ...
-            'TickDir','in', ...
-            'Box','on', ...
-            'Layer','top');
-
-        grid(ax,'on');
-        ax.GridAlpha = 0.18;
-
-        text(ax, 0.78, 0.06, panel_label{k}, ...
-            'Units','normalized', 'FontSize',11, 'FontWeight','bold');
-    end
-
-    legend_ax = axes('Position',[0.815 0.62 0.15 0.20], 'Visible','off'); %#ok<LAXES>
-    hold(legend_ax, 'on');
-
-    h1 = plot(legend_ax, nan, nan, '-',  'Color', col_mgpr, 'LineWidth', lw_med);
-    h2 = plot(legend_ax, nan, nan, '--', 'Color', col_mgpr, 'LineWidth', lw_CI);
-
-    if PLOT_ONE_CRF
-        h3 = plot(legend_ax, nan, nan, '-',  'Color', col_crf, 'LineWidth', lw_crf);
-        h4 = plot(legend_ax, nan, nan, 'o', ...
-            'MarkerFaceColor', col_data, ...
-            'MarkerEdgeColor','k', ...
-            'MarkerSize',5, ...
-            'LineStyle','none');
-
-        lgd = legend(legend_ax, [h1 h2 h3 h4], ...
-            {'Median (MGPR)', ...
-             '95% CI (MGPR)', ...
-             'One CRF (MGPR)', ...
-             'Observed data'}, ...
-            'Location','northwest', 'FontSize',8, 'Box','on');
+        observed = Plot.observed.(field);
+        valid = isfinite(observed) & isfinite(depth) & observed > 0;
+        semilogx(axh,observed(valid),depth(valid),'o', ...
+            'MarkerSize',5.5,'MarkerFaceColor',color_data, ...
+            'MarkerEdgeColor','k','LineWidth',0.8,'LineStyle','none');
+        set(axh,'XScale','log');
     else
-        h3 = plot(legend_ax, nan, nan, 'o', ...
-            'MarkerFaceColor', col_data, ...
-            'MarkerEdgeColor','k', ...
-            'MarkerSize',5, ...
-            'LineStyle','none');
-
-        lgd = legend(legend_ax, [h1 h2 h3], ...
-            {'Median (MGPR)', ...
-             '95% CI (MGPR)', ...
-             'Observed data'}, ...
-            'Location','northwest', 'FontSize',8, 'Box','on');
-    end
-
-    lgd.ItemTokenSize = [14 7];
-    lgd.AutoUpdate = 'off';
-end
-
-function fig = plot_tconst_vs_mgpr(TC, MG, PLOT_ONE_CRF)
-    field_name = {'LL','PI','LI','sigma_p_eff','su'};
-
-    x_label = { ...
-        'LL (%)', ...
-        'PI (%)', ...
-        'LI (%)', ...
-        '\sigma''_p (kN/m^2)', ...
-        's_u (kN/m^2)'};
-
-    x_lim = { ...
-        [20 50], ...
-        [0 30], ...
-        [0 2.5], ...
-        [1e1 1e3], ...
-        [20 120]};
-
-    use_log_x = [false false false true false];
-    panel_label = {'(a)','(b)','(c)','(d)','(e)'};
-
-    col_tconst = [0.45 0.45 0.45];
-    col_mgpr   = [1.00 0.00 1.00];
-    col_crf    = [0.00 0.65 0.00];
-    col_data   = [1.00 0.90 0.00];
-
-    lw_med = 1.6;
-    lw_CI  = 1.2;
-    lw_crf = 1.0;
-
-    fig = figure('Name','t-const vs MGPR', 'Color','w', 'Position',[80 80 1280 500]);
-
-    left_margin = 0.055;
-    right_blank = 0.225;   % legend 區域，已縮小，不像原本那麼寬
-    bottom_pos  = 0.16;
-    height_pos  = 0.76;
-    gap         = 0.040;
-    n_col       = 5;
-
-    tile_width = (1 - left_margin - right_blank - gap*(n_col-1)) / n_col;
-
-    for k = 1:n_col
-        fname = field_name{k};
-        left_pos = left_margin + (k-1)*(tile_width + gap);
-
-        ax = axes('Position',[left_pos bottom_pos tile_width height_pos]); %#ok<LAXES>
-        hold(ax,'on'); box(ax,'on');
-
-        depth = TC.depth_m(:);
-
-        if use_log_x(k)
-            % ----- t-const -----
-            plot_profile_log(ax, TC.median.(fname), depth, '-',  col_tconst, lw_med);
-            plot_profile_log(ax, TC.CI_low.(fname), depth, '--', col_tconst, lw_CI);
-            plot_profile_log(ax, TC.CI_up.(fname),  depth, '--', col_tconst, lw_CI);
-
-            % ----- MGPR -----
-            plot_profile_log(ax, MG.median.(fname), depth, '-',  col_mgpr, lw_med);
-            plot_profile_log(ax, MG.CI_low.(fname), depth, '--', col_mgpr, lw_CI);
-            plot_profile_log(ax, MG.CI_up.(fname),  depth, '--', col_mgpr, lw_CI);
-
-            % ----- one MGPR CRF realization -----
-            if PLOT_ONE_CRF
-                plot_profile_log(ax, MG.one.(fname), depth, '-', col_crf, lw_crf);
-            end
-
-            % ----- observed -----
-            x_real = MG.real.(fname);
-            valid_real = isfinite(x_real) & x_real > 0;
-            semilogx(ax, x_real(valid_real), depth(valid_real), 'o', ...
-                'MarkerSize', 5.5, 'MarkerFaceColor', col_data, ...
-                'MarkerEdgeColor','k', 'LineWidth',0.8, 'LineStyle','none');
-
-            set(ax,'XScale','log');
-        else
-            % ----- t-const -----
-            plot(ax, TC.median.(fname), depth, '-',  'Color', col_tconst, 'LineWidth', lw_med);
-            plot(ax, TC.CI_low.(fname), depth, '--', 'Color', col_tconst, 'LineWidth', lw_CI);
-            plot(ax, TC.CI_up.(fname),  depth, '--', 'Color', col_tconst, 'LineWidth', lw_CI);
-
-            % ----- MGPR -----
-            plot(ax, MG.median.(fname), depth, '-',  'Color', col_mgpr, 'LineWidth', lw_med);
-            plot(ax, MG.CI_low.(fname), depth, '--', 'Color', col_mgpr, 'LineWidth', lw_CI);
-            plot(ax, MG.CI_up.(fname),  depth, '--', 'Color', col_mgpr, 'LineWidth', lw_CI);
-
-            % ----- one MGPR CRF realization -----
-            if PLOT_ONE_CRF
-                plot(ax, MG.one.(fname), depth, '-', 'Color', col_crf, 'LineWidth', lw_crf);
-            end
-
-            % ----- observed -----
-            x_real = MG.real.(fname);
-            valid_real = isfinite(x_real);
-            plot(ax, x_real(valid_real), depth(valid_real), 'o', ...
-                'MarkerSize', 5.5, 'MarkerFaceColor', col_data, ...
-                'MarkerEdgeColor','k', 'LineWidth',0.8, 'LineStyle','none');
+        plot(axh,Plot.median.(field),depth,'-', ...
+            'Color',color_median,'LineWidth',1.6);
+        plot(axh,Plot.CI_low.(field),depth,'--', ...
+            'Color',color_median,'LineWidth',1.2);
+        plot(axh,Plot.CI_up.(field),depth,'--', ...
+            'Color',color_median,'LineWidth',1.2);
+        if plot_one
+            plot(axh,Plot.one.(field),depth,'-', ...
+                'Color',color_realization,'LineWidth',1.0);
         end
-
-        set(ax,'YDir','reverse');
-        ylim(ax, [12 27]);
-        xlim(ax, x_lim{k});
-
-        xlabel(ax, x_label{k}, 'FontSize', 13);
-        ylabel(ax, 'Depth (m)', 'FontSize', 12);
-
-        set(ax, ...
-            'FontSize', 10, ...
-            'LineWidth', 0.9, ...
-            'TickDir','in', ...
-            'Box','on', ...
-            'Layer','top');
-
-        grid(ax,'on');
-        ax.GridAlpha = 0.18;
-
-        text(ax, 0.78, 0.06, panel_label{k}, ...
-            'Units','normalized', 'FontSize',11, 'FontWeight','bold');
+        observed = Plot.observed.(field);
+        valid = isfinite(observed) & isfinite(depth);
+        plot(axh,observed(valid),depth(valid),'o', ...
+            'MarkerSize',5.5,'MarkerFaceColor',color_data, ...
+            'MarkerEdgeColor','k','LineWidth',0.8,'LineStyle','none');
     end
 
-    % ===== compact legend：右側小盒子 =====
-    legend_ax = axes('Position',[0.805 0.60 0.155 0.24], 'Visible','off'); %#ok<LAXES>
-    hold(legend_ax, 'on');
-
-    h1 = plot(legend_ax, nan, nan, '-',  'Color', col_tconst, 'LineWidth', lw_med);
-    h2 = plot(legend_ax, nan, nan, '--', 'Color', col_tconst, 'LineWidth', lw_CI);
-    h3 = plot(legend_ax, nan, nan, '-',  'Color', col_mgpr,   'LineWidth', lw_med);
-    h4 = plot(legend_ax, nan, nan, '--', 'Color', col_mgpr,   'LineWidth', lw_CI);
-
-    if PLOT_ONE_CRF
-        h5 = plot(legend_ax, nan, nan, '-',  'Color', col_crf, 'LineWidth', lw_crf);
-        h6 = plot(legend_ax, nan, nan, 'o', 'MarkerFaceColor', col_data, ...
-            'MarkerEdgeColor','k', 'MarkerSize',5, 'LineStyle','none');
-
-        lgd = legend(legend_ax, [h1 h2 h3 h4 h5 h6], ...
-            {'Median (t-const)', ...
-             '95% CI (t-const)', ...
-             'Median (MGPR)', ...
-             '95% CI (MGPR)', ...
-             'One CRF (MGPR)', ...
-             'Observed data'}, ...
-            'Location','northwest', 'FontSize',8, 'Box','on');
+    set(axh,'YDir','reverse','FontName','Times New Roman', ...
+        'FontSize',10,'LineWidth',0.9,'TickDir','in','Layer','top');
+    ylim(axh,depth_limit);
+    xlim(axh,x_limits{k});
+    xlabel(axh,x_labels{k},'Interpreter','tex','FontSize',13);
+    if k == 1
+        ylabel(axh,'Depth (m)','FontSize',12);
     else
-        h5 = plot(legend_ax, nan, nan, 'o', 'MarkerFaceColor', col_data, ...
-            'MarkerEdgeColor','k', 'MarkerSize',5, 'LineStyle','none');
-
-        lgd = legend(legend_ax, [h1 h2 h3 h4 h5], ...
-            {'Median (t-const)', ...
-             '95% CI (t-const)', ...
-             'Median (multi t-GPR)', ...
-             '95% CI (multi t-GPR)', ...
-             'Observed data'}, ...
-            'Location','northwest', 'FontSize',8, 'Box','on');
+        set(axh,'YTickLabel',[]);
     end
-
-    lgd.ItemTokenSize = [14 7];
-    lgd.AutoUpdate = 'off';
+    grid(axh,'on');
+    axh.GridAlpha = 0.18;
+    text(axh,0.78,0.06,panel_labels{k},'Units','normalized', ...
+        'FontSize',11,'FontWeight','bold');
 end
 
-function plot_profile_log(ax, x, z, lineStyle, color, lw)
-    x = x(:);
-    z = z(:);
-    valid = isfinite(x) & isfinite(z) & x > 0;
-    semilogx(ax, x(valid), z(valid), lineStyle, 'Color', color, 'LineWidth', lw);
+% A compact English legend is placed in the reserved space on the right.
+legend_ax = axes('Position',[0.815 0.62 0.15 0.20], ...
+    'Visible','off'); %#ok<LAXES>
+hold(legend_ax,'on');
+h_median = plot(legend_ax,nan,nan,'-','Color',color_median,'LineWidth',1.6);
+h_ci = plot(legend_ax,nan,nan,'--','Color',color_median,'LineWidth',1.2);
+h_data = plot(legend_ax,nan,nan,'o','MarkerFaceColor',color_data, ...
+    'MarkerEdgeColor','k','MarkerSize',5,'LineStyle','none');
+
+if plot_one
+    h_one = plot(legend_ax,nan,nan,'-','Color',color_realization, ...
+        'LineWidth',1.0);
+    legend_handles = [h_median h_ci h_one h_data];
+    legend_text = {'Median (MGPR)','95% interval (MGPR)', ...
+        'One realization','Observed data'};
+else
+    legend_handles = [h_median h_ci h_data];
+    legend_text = {'Median (MGPR)','95% interval (MGPR)','Observed data'};
 end
 
-function m = nanmean_row(A)
-    m = nan(size(A,1),1);
-    for i = 1:size(A,1)
-        x = A(i,:);
-        x = x(isfinite(x));
-        if ~isempty(x)
-            m(i) = mean(x);
-        end
-    end
+lgd = legend(legend_ax,legend_handles,legend_text, ...
+    'Location','northwest','FontSize',8,'Box','on');
+lgd.ItemTokenSize = [14 7];
+lgd.AutoUpdate = 'off';
 end
 
-function v = nanvar_row(A)
-    v = nan(size(A,1),1);
-    for i = 1:size(A,1)
-        x = A(i,:);
-        x = x(isfinite(x));
-        if numel(x) >= 2
-            v(i) = var(x, 0);
-        elseif numel(x) == 1
-            v(i) = 0;
-        end
+function plot_positive_profile(axh,x,z,line_style,color,line_width)
+x = x(:);
+z = z(:);
+valid = isfinite(x) & isfinite(z) & x > 0;
+semilogx(axh,x(valid),z(valid),line_style, ...
+    'Color',color,'LineWidth',line_width);
+end
+
+function m = row_mean(A)
+m = nan(size(A,1),1);
+for i = 1:size(A,1)
+    values = A(i,isfinite(A(i,:)));
+    if ~isempty(values)
+        m(i) = mean(values);
     end
+end
+end
+
+function v = row_variance(A)
+v = nan(size(A,1),1);
+for i = 1:size(A,1)
+    values = A(i,isfinite(A(i,:)));
+    if numel(values) >= 2
+        v(i) = var(values,0);
+    elseif numel(values) == 1
+        v(i) = 0;
+    end
+end
+end
+
+function A = make_spd(A,relative_floor)
+A = real((A+A')/2);
+[V,D] = eig(A);
+d = real(diag(D));
+scale = max([max(abs(d)),1]);
+d = max(d,relative_floor*scale);
+A = real(V*diag(d)*V');
+A = real((A+A')/2);
 end
