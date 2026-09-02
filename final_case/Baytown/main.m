@@ -7,7 +7,19 @@ T_mcmc       = 5;
 SAVE_TMCMC   = false;
 SAVE_FIGURES = false;
 
-%% ===== Load Johnson parameters and site data =====
+%% ===== Load model parameters and site data =====
+% HBM_CLAY_8_OCR_sigv_new.mat:
+%   Johnson transformation parameters used by HBM-MUSIC-3X.
+%
+% Cs.mat:
+%   Cross-parameter covariance matrix adopted from HBM-MUSIC-3X.
+%
+% Cs_global.mat:
+%   Global cross-parameter covariance matrix estimated from the database.
+%
+% integrated_geotechnical_data_0521.mat:
+%   Baytown site observations, coordinates, depths, and effective stresses.
+
 load('HBM_CLAY_8_OCR_sigv_new.mat');
 load('Cs_global.mat');
 load('integrated_geotechnical_data_0521.mat');
@@ -35,7 +47,10 @@ elseif Scenario == 2
     E = [6.401 6.401 6.401 6.401 6.401 6.401 6.401 6.401 0.000 12.802 0.000 12.802 0.000 12.802];
     N = [6.4 14.173 1.372 19.202 26.974 4.267 12.802 21.336 25.604 25.604 12.802 12.802 0.000 0.000];
 end
-
+%% ===== Select the cross-parameter covariance matrix =====
+% Current setting: use the global covariance matrix.
+% To use the HBM-MUSIC-3X covariance, load Cs.mat and replace
+% Cs_global below with the variable stored in Cs.mat.
 Cs = Cs_global;
 Cs = Cs(para_Cs, para_Cs);
 Cs = (Cs + Cs') / 2;
@@ -219,11 +234,24 @@ eigvals = diag(omege_t_Cs);
 [~, idx] = sort(eigvals, 'descend');
 phi_t_Cs   = phi_t_Cs(:, idx);
 L_Cs_fixed = chol(Cs, 'lower');
-
+%% ===== TMCMC parameter bounds =====
+% Parameter order:
+% x(1): log inverse residual amplitude,  bhp = 1/exp(x(1))
+% x(2): log vertical residual SOF
+% x(3): log horizontal residual SOF
+% x(4): log Matern smoothness parameter
+% x(5): log inverse trend amplitude,     ahp = 1/exp(x(5))
+% x(6): log vertical trend SOF
+% x(7): log horizontal trend SOF
+%
+% A trend SOF much larger than the corresponding site dimension
+% produces an almost constant trend in that direction.
+% If both vertical and horizontal trend SOFs are very large,
+% the MGPR trend approaches the t-const model.
 x_low = [-log(10), log(0.01), log(0.1),  log(0.1), -log(10),  log(max(temp_z(:))/10), log(max(temp_h(:))/10)];
 x_up  = [-log(0.01),log(100), log(100), log(3.0), -log(0.01), log(max(temp_z(:))*10), log(max(temp_h(:))*10)];
 
-y.eig_thresh = 0.9999;
+y.eig_thresh = 0.999;
 
 temp_x_ele = abs([X; X_test] - [X; X_test]');
 temp_y_ele = abs([Y; Y_test] - [Y; Y_test]');
