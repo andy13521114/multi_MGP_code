@@ -4,7 +4,7 @@ clc; clear; close all;
 timer_total = tic;
 
 %% ===================== USER SETTINGS =====================
-T_mcmc   = 500;                  % TMCMC posterior samples (increase for final runs)
+T_mcmc   = 10;                  % TMCMC posterior samples (increase for final runs)
 Scenario = 1;
 
 param_name_all = {'fs','qt','u2'};
@@ -550,10 +550,12 @@ TIME_CRF = toc(timer_crf);
 
 %% ========================================================================
 % (8) FINAL VALIDATION PROFILES (one figure per parameter)
-% Magenta = posterior summary, green = one CRF draw, yellow = observations.
+% Black = median of all CRF realizations, magenta = posterior 95% CI,
+% green = one CRF realization, and yellow = validation observations.
 %% ========================================================================
 x_lims_all = {[0 20], [0 700], [-100 200]};  % fs, qt, Delta-u in kPa
 col_mgpr = [1.00 0.00 1.00];
+col_med  = [0.00 0.00 0.00];
 col_crf  = [0.10 0.62 0.24];
 col_obs  = [1.00 0.90 0.00];
 
@@ -590,13 +592,16 @@ for p = 1:M
         h_crf = plot(ax,STORE_raw_sample{group_i}(:,p)*1000,z_ele,'-', ...
             'Color',col_crf,'LineWidth',1.0);
 
-        % Posterior 95% interval and median.
+        % Posterior 95% interval from all conditional CRF realizations.
         h_ci = plot(ax,STORE_raw_lo{group_i}(:,p)*1000,z_ele,'--', ...
             'Color',col_mgpr,'LineWidth',1.5);
         plot(ax,STORE_raw_hi{group_i}(:,p)*1000,z_ele,'--', ...
             'Color',col_mgpr,'LineWidth',1.5,'HandleVisibility','off');
+
+        % Pointwise median of all conditional CRF realizations.
+        % Draw it after the realization and CI so the black line remains visible.
         h_med = plot(ax,STORE_raw_mean{group_i}(:,p)*1000,z_ele,'-', ...
-            'Color',col_mgpr,'LineWidth',2.0);
+            'Color',col_med,'LineWidth',2.2);
 
         % Validation observations are shown as yellow points, not a line.
         x_obs = STORE_raw_y_true{group_i}(:,p)*1000;
@@ -611,7 +616,8 @@ for p = 1:M
         if group_i == 1
             ylabel(ax,'Depth (m)','FontSize',10);
             legend(ax,[h_med,h_ci,h_crf,h_obs], ...
-                {'Median (MGPR)','95% CI (MGPR)','1 CRF realization','Validation data'}, ...
+                {'Median of CRF realizations','95% CI (MGPR)', ...
+                 '1 CRF realization','Validation data'}, ...
                 'Location','best','FontSize',8,'Box','on');
         else
             ax.YTickLabel = [];
